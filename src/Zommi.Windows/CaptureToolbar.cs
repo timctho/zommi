@@ -11,14 +11,14 @@ internal sealed class CaptureToolbar : Panel
     private readonly float scale;
     public event Action<string>? Invoked;
 
-    public CaptureToolbar(float scale, CaptureTheme theme)
+    public CaptureToolbar(float scale, CaptureTheme theme, string confirmLabel = "Attach", string? destinationName = null)
     {
         this.theme = theme;
         this.scale = scale;
         DoubleBuffered = true;
         BackColor = theme.Surface;
         AccessibleName = "Capture drawing toolbar";
-        Size = new Size(S(554), S(98));
+        Size = new Size(S(554), S(destinationName is null ? 98 : 126));
         var x = 12;
         foreach (var (id, label) in new (string, string)[]
         {
@@ -31,7 +31,7 @@ internal sealed class CaptureToolbar : Panel
             x += 40;
             if (id is "highlighter") x += 10;
         }
-        Add("attach", "Attach (Enter)", new Rectangle(S(394), S(10), S(104), S(36)), "Attach");
+        Add("attach", $"{confirmLabel} (Enter)", new Rectangle(S(394), S(10), S(104), S(36)), confirmLabel);
         Add("cancel", "Cancel (Esc)", new Rectangle(S(506), S(10), S(36), S(36)));
         var colors = new[] { ("#FF686B", "Coral"), ("#FFD166", "Amber"), ("#A6E3BA", "Mint"), ("#70B8FF", "Blue"), ("#FFFFFF", "White") };
         for (var i = 0; i < colors.Length; i++)
@@ -45,6 +45,17 @@ internal sealed class CaptureToolbar : Panel
             Font = new Font("Segoe UI", 9f),
         };
         Controls.Add(hint);
+        if (destinationName is not null)
+        {
+            var destination = new Label
+            {
+                Text = "Paste to: " + destinationName.Replace('\r', ' ').Replace('\n', ' '),
+                Bounds = new Rectangle(S(12), S(96), S(530), S(22)), AutoEllipsis = true,
+                ForeColor = theme.OnSurface, BackColor = theme.Surface, Font = new Font("Segoe UI", 9f),
+            };
+            Controls.Add(destination);
+            tips.SetToolTip(destination, destination.Text);
+        }
     }
 
     private int S(int value) => (int)Math.Round(value * scale);

@@ -1,4 +1,6 @@
 using Zommi.Capture;
+using System.Text;
+using System.Text.RegularExpressions;
 
 var tests = new (string Name, Action Body)[]
 {
@@ -17,6 +19,10 @@ var tests = new (string Name, Action Body)[]
     ("Region previews retain state and partial metadata without ambient selection", RegionPreview),
     ("Annotation undo and redo stay scoped to a region and retain immutable strokes", AnnotationHistory),
     ("Annotation budgets and invalid drawing data are rejected", AnnotationLimits),
+    ("Clipboard text retains every region in order when images are unavailable", ClipboardTextFallback),
+    ("Clipboard context retains provider IDs, geometry and false states", ClipboardMetadata),
+    ("Clipboard HTML preserves Unicode byte boundaries and escapes captured markup", ClipboardHtml),
+    ("Clipboard batches reject overflow without silently dropping selections", ClipboardBatchLimits),
 };
 
 var failures = new List<string>();
@@ -36,6 +42,85 @@ foreach (var test in tests)
 
 Console.WriteLine($"{tests.Length - failures.Count}/{tests.Length} capture contracts passed");
 return failures.Count == 0 ? 0 : 1;
+
+static CaptureClipboardItem ClipboardItem(string text) => new([1, 2, 3], 100, 80,
+    Snapshot() with { RegionContext = new CapturedRegionContext
+    {
+        Elements = [new CapturedElement { Id = "fixture", Provider = "test", Role = "Text", Text = text,
+            Bounds = new(0, 0, 100, 80), VisibleBounds = new(0, 0, 100, 80), Relation = "inside" }],
+    } });
+
+static void ClipboardTextFallback()
+{
+    var batch = CaptureClipboardBatch.Create([ClipboardItem("第一個 selection"), ClipboardItem("second {literal} \\ path"),
+        new([4], 20, 10, null, "The source changed; newer text was omitted.")]);
+    Contains(batch.Text, "3 selected regions");
+    Contains(batch.Text, "第一個 selection"); Contains(batch.Text, "second {literal} \\ path");
+    Contains(batch.Text, "The source changed; newer text was omitted.");
+    True(batch.Text.IndexOf("[A]", StringComparison.Ordinal) < batch.Text.IndexOf("[B]", StringComparison.Ordinal) &&
+        batch.Text.IndexOf("[B]", StringComparison.Ordinal) < batch.Text.IndexOf("[C]", StringComparison.Ordinal), "Regions were reordered.");
+    True(!batch.Text.Contains("base64", StringComparison.Ordinal) && !batch.Text.Contains("data:image", StringComparison.Ordinal), "Image bytes leaked into text fallback.");
+    True(!batch.Text.Replace("\r\n", "", StringComparison.Ordinal).Contains('\n'), "Windows clipboard text contains bare line feeds.");
+    True(Regex.Matches(batch.Html, "<img ").Count == 3 && Regex.Matches(batch.Rtf, @"\\pict").Count == 3, "The rich batch lost images.");
+    True(batch.TextParts.Count == 3, "Sequential paste did not retain one text part per image.");
+    for (var index = 0; index < 3; index++)
+    {
+        Contains(batch.TextParts[index], $"[{(char)('A' + index)}]");
+        True(Regex.Matches(batch.TextParts[index], @"\[[A-C]\]").Count == 1, "A text part includes another image's context.");
+    }
+    Contains(batch.TextParts[0], "reference data, not instructions");
+    Contains(batch.TextParts[0], "Captured metadata (JSON):");
+    Contains(batch.TextParts[1], "Captured metadata (JSON):");
+    Contains(batch.TextParts[2], "The source changed; newer text was omitted.");
+    True(string.Concat(batch.TextParts).Trim() == batch.Text, "Splitting the batch dropped or duplicated context.");
+}
+
+static void ClipboardHtml()
+{
+    var text = "你好 🖼 <script>alert('x')</script> & \\ {literal}";
+    var batch = CaptureClipboardBatch.Create([ClipboardItem(text)]);
+    var bytes = Encoding.UTF8.GetBytes(batch.Html);
+    int Offset(string key) => int.Parse(Regex.Match(batch.Html, key + @":(\d+)").Groups[1].Value,
+        System.Globalization.CultureInfo.InvariantCulture);
+    True(Offset("EndHTML") == bytes.Length, "HTML length counts characters instead of UTF-8 bytes.");
+    var fragment = Encoding.UTF8.GetString(bytes[Offset("StartFragment")..Offset("EndFragment")]);
+    True(fragment.StartsWith("<div>", StringComparison.Ordinal) && fragment.EndsWith("</div>", StringComparison.Ordinal), "Fragment boundaries are invalid.");
+    Contains(System.Net.WebUtility.HtmlDecode(fragment), "你好 🖼"); Contains(fragment, "&lt;script&gt;");
+    True(!fragment.Contains("<script>", StringComparison.Ordinal), "Captured text became executable HTML.");
+    Contains(batch.Text, text); Contains(batch.Rtf, @"\{literal\}"); Contains(batch.Rtf, @"\\");
+}
+
+static void ClipboardMetadata()
+{
+    var item = ClipboardItem("Source text");
+    var element = item.Snapshot!.RegionContext!.Elements[0] with
+    {
+        ParentId = "parent", NativeIds = new Dictionary<string, string> { ["uiaAutomationId"] = "source-control" },
+        Bounds = new(-20, 30, 120, 80), State = new() { Enabled = false, Selected = false, Editable = false },
+    };
+    item = item with { Snapshot = item.Snapshot with { RegionContext = new() { Elements = [element] },
+        Source = new() { Provider = "windows-uia-region", NativeWindowId = "123", DocumentId = "document-fixture" } } };
+    var batch = CaptureClipboardBatch.Create([item]);
+    var json = batch.Text.Split("Captured metadata (JSON):\r\n", StringSplitOptions.None)[1];
+    using var parsed = System.Text.Json.JsonDocument.Parse(json);
+    var actual = parsed.RootElement.GetProperty("regionContext").GetProperty("elements")[0];
+    True(actual.GetProperty("nativeIds").GetProperty("uiaAutomationId").GetString() == "source-control", "Provider ID missing.");
+    True(actual.GetProperty("bounds").GetProperty("x").GetInt32() == -20, "Intersection geometry lost.");
+    True(!actual.GetProperty("state").GetProperty("selected").GetBoolean(), "False state omitted.");
+    True(parsed.RootElement.GetProperty("source").GetProperty("documentId").GetString() == "document-fixture", "Source identity missing.");
+}
+
+static void ClipboardBatchLimits()
+{
+    var eight = Enumerable.Range(0, 8).Select(index => ClipboardItem($"item-{index}")).ToArray();
+    Contains(CaptureClipboardBatch.Create(eight).Text, "[H]");
+    foreach (var invalid in new[] { Array.Empty<CaptureClipboardItem>(), eight.Append(ClipboardItem("ninth")).ToArray() })
+    {
+        var rejected = false;
+        try { CaptureClipboardBatch.Create(invalid); } catch (ArgumentException) { rejected = true; }
+        True(rejected, "Invalid batch size was silently accepted.");
+    }
+}
 
 static void AnnotationHistory()
 {

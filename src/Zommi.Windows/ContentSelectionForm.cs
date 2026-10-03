@@ -18,6 +18,7 @@ internal class ContentSelectionForm : PointSelectionForm
     private readonly CaptureToolbar toolbar;
     private readonly CaptureTheme theme;
     private readonly int maximumSelections;
+    private readonly string confirmLabel;
     private readonly float scale;
     private Point? anchor;
     private Rectangle dragged;
@@ -29,17 +30,19 @@ internal class ContentSelectionForm : PointSelectionForm
     private readonly List<AnnotationPoint> points = [];
     private ImageAnnotation? pendingStroke;
 
-    public ContentSelectionForm(uint returnProcessId, Bitmap capturedDesktop, int maximumSelections = 8, CaptureTheme? theme = null) : base(returnProcessId)
+    public ContentSelectionForm(uint returnProcessId, Bitmap capturedDesktop, int maximumSelections = 8, CaptureTheme? theme = null,
+        string confirmLabel = "Attach", string? destinationName = null) : base(returnProcessId)
     {
         Text = "Zommi content selection";
         this.maximumSelections = maximumSelections;
+        this.confirmLabel = confirmLabel;
         AutoScaleMode = AutoScaleMode.None;
         Opacity = 1;
         frozenAt = DateTimeOffset.UtcNow;
         desktop = capturedDesktop;
         scale = Math.Max(1, DeviceDpi / 96f);
         this.theme = theme ?? CaptureTheme.Default;
-        toolbar = new CaptureToolbar(scale, this.theme);
+        toolbar = new CaptureToolbar(scale, this.theme, confirmLabel, destinationName);
         toolbar.Invoked += InvokeTool;
         Controls.Add(toolbar);
         UpdateToolbar(reposition: true);
@@ -51,6 +54,18 @@ internal class ContentSelectionForm : PointSelectionForm
     }).ToArray();
     public string? ErrorMessage => null;
     private Entry? Active => activeIndex >= 0 && activeIndex < entries.Count ? entries[activeIndex] : null;
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.KeyCode == Keys.ControlKey) { UpdateToolbar(); Invalidate(); }
+    }
+
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        base.OnKeyUp(e);
+        if (e.KeyCode == Keys.ControlKey) { UpdateToolbar(reposition: true); Invalidate(); }
+    }
 
     protected override bool ProcessCmdKey(ref Message message, Keys keyData)
     {
@@ -89,24 +104,29 @@ internal class ContentSelectionForm : PointSelectionForm
                 else if (Active is not null) tool = action;
                 break;
         }
-        UpdateToolbar(reposition: action is "delete" or "select");
+        UpdateToolbar(reposition: action is "delete" or "select", choosingRegion: action == "select");
         Invalidate();
         Focus();
     }
 
-    private void UpdateToolbar(bool reposition = false)
+    private void UpdateToolbar(bool reposition = false, bool choosingRegion = false)
     {
         var status = Active is { } active
             ? active.Drawing.Strokes.Count >= AnnotationDocument.MaximumStrokes
                 ? "Drawing limit · Undo a mark to continue"
-                : $"{(char)('A' + activeIndex)} · {active.Selection.Region.Width} × {active.Selection.Region.Height} · Draw, then attach"
+                : $"{(char)('A' + activeIndex)} · {active.Selection.Region.Width} × {active.Selection.Region.Height} · Draw, then {confirmLabel.ToLowerInvariant()}"
             : "Drag to select · Ctrl for more";
         toolbar.UpdateState(tool, color, widthIndex, entries.Count, maximumSelections,
             Active?.Drawing.CanUndo ?? false, Active?.Drawing.CanRedo ?? false, status);
+        // Ctrl-drag can start where the previous crop's toolbar was. Keep that
+        // area available until Ctrl is released and the current drag is complete.
+        toolbar.Visible = (ModifierKeys & Keys.Control) == 0 && anchor is null;
         Cursor = Cursors.Cross;
         if (reposition)
         {
-            var region = tool == "select" ? null : Active?.Selection.Region;
+            // Explicit Add region/S still moves the toolbar away for the next
+            // drag. A completed Ctrl crop anchors it to that crop instead.
+            var region = choosingRegion ? null : Active?.Selection.Region;
             var screen = Screen.FromPoint(region is { } selected ? new Point(selected.Left + selected.Width / 2, selected.Top + selected.Height / 2) : Cursor.Position);
             var available = screen.WorkingArea;
             var margin = (int)(12 * scale);
@@ -145,6 +165,7 @@ internal class ContentSelectionForm : PointSelectionForm
             anchor = PointToScreen(e.Location);
             dragged = Rectangle.Empty;
             Capture = true;
+            UpdateToolbar(); Invalidate();
             return;
         }
         var screenPoint = PointToScreen(e.Location);
@@ -197,7 +218,7 @@ internal class ContentSelectionForm : PointSelectionForm
         var bounds = Rectangle.Intersect(RectangleBetween(start, PointToScreen(e.Location)), Bounds);
         dragged = Rectangle.Empty;
         InvalidateArea(previous);
-        if (bounds.Width < 4 || bounds.Height < 4 || entries.Count >= maximumSelections) return;
+        if (bounds.Width < 4 || bounds.Height < 4 || entries.Count >= maximumSelections) { UpdateToolbar(); return; }
         var duplicate = entries.FindIndex(entry => entry.Selection.Region == bounds);
         if (duplicate >= 0) activeIndex = duplicate;
         else
@@ -295,7 +316,7 @@ internal class ContentSelectionForm : PointSelectionForm
             using var fill = new SolidBrush(theme.Surface); g.FillRectangle(fill, label);
             TextRenderer.DrawText(g, $"{rectangle.Width} × {rectangle.Height}", font, label, theme.Accent, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
-        for (var i = 3; i > 0; i--)
+        for (var i = toolbar.Visible ? 3 : 0; i > 0; i--)
         {
             var shadow = toolbar.Bounds; shadow.Inflate(i * 2, i * 2); shadow.Offset(0, 2);
             using var path = CaptureToolbar.Rounded(shadow, 16 * scale);

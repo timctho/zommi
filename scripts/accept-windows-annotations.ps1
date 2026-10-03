@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$CaptureHost, [Parameter(Mandatory=$true)][string]$OutputDirectory)
+param([Parameter(Mandatory=$true)][string]$CaptureHost, [Parameter(Mandatory=$true)][string]$OutputDirectory, [switch]$HoverOnly)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'accept-windows-capture.ps1') -PackageDirectory (Split-Path $CaptureHost) -HelpersOnly
 Add-Type -AssemblyName System.Windows.Forms
@@ -12,13 +12,40 @@ using System;
 using System.Runtime.InteropServices;
 public static class ZommiAnnotationInput {
     [DllImport("user32.dll")] private static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
-    public static void Control(bool down) { keybd_event(0x11, 0, down ? 0u : 2u, UIntPtr.Zero); System.Threading.Thread.Sleep(40); }
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
+    public static void Control(bool down) {
+        keybd_event(0x11, 0, down ? 0u : 2u, UIntPtr.Zero);
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        while (((GetAsyncKeyState(0x11) & 0x8000) != 0) != down) {
+            if (watch.ElapsedMilliseconds > 2000) throw new InvalidOperationException("Synthetic Ctrl state did not settle.");
+            System.Threading.Thread.Sleep(10);
+        }
+    }
 }
 '@
 Assert-DesktopCaptureSurface
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 function Click-Tool([IntPtr]$Window, [string]$Name) {
     if (-not [ZommiWindowsAcceptanceNative]::ClickNamedButton($Window,$Name)) { throw "Drawing tool unavailable: $Name" }
+}
+function Assert-ToolbarNearCrop([IntPtr]$Window, [int]$Bottom) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $bounds = [ZommiWindowsAcceptanceNative]::NamedButtonContainerBounds($Window,'Pen')
+        if ($bounds.Length -eq 4 -and [Math]::Abs($bounds[0] - 175) -le 64 -and
+            $bounds[1] -gt $Bottom -and $bounds[1] -le $Bottom + 64) { return }
+        Start-Sleep -Milliseconds 10
+    } while ($watch.ElapsedMilliseconds -lt 1000)
+    throw "Drawing toolbar did not follow the selected crop after Ctrl release: cropBottom=$Bottom toolbar=$($bounds -join ',')"
+}
+function Save-Toolbar([string]$Name) {
+    Start-Sleep -Milliseconds 150
+    $bitmap = [Drawing.Bitmap]::new(900,600)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen(140,140,0,0,$bitmap.Size)
+        $bitmap.Save((Join-Path $OutputDirectory "toolbar-$Name.png"),[Drawing.Imaging.ImageFormat]::Png)
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
 }
 function Assert-ColoredPixels($Item, [string]$Color) {
     $bytes = [Convert]::FromBase64String($Item.dataUrl.Substring($Item.dataUrl.IndexOf(',')+1))
@@ -39,10 +66,15 @@ function Assert-ColoredPixels($Item, [string]$Color) {
     } finally { $image.Dispose(); $stream.Dispose() }
 }
 $results = @()
-foreach ($case in @('tools','multiple-regions','changed-source','cancel','image-selector')) {
+foreach ($case in $(if ($HoverOnly) { @('hover-source') } else { @('tools','multiple-regions','ctrl-release','hover-source','changed-source','cancel','image-selector') })) {
+    $multiple = $case -in @('multiple-regions','ctrl-release')
     $fixture = [ZommiContextFixture]::new()
     try {
         $fixture.ExpandForAnnotations()
+        if ($case -eq 'hover-source') {
+            $fixture.EnableHoverText()
+            [ZommiWindowsAcceptanceNative]::SetPhysicalCursorPos(120,120) | Out-Null
+        }
         $fixture.Raise()
         Start-Sleep -Milliseconds 200
         $readyMs = 0
@@ -51,10 +83,34 @@ foreach ($case in @('tools','multiple-regions','changed-source','cancel','image-
             param($process)
             $title = if ($case -eq 'image-selector') { 'Zommi image selection' } else { 'Zommi content selection' }
             $selector = Wait-ForWindow -ProcessId $process.Id -Title $title
-            if ($case -eq 'multiple-regions') {
+            # HWND/title creation precedes the borderless selector's final layout.
+            # Starting then offsets the first point by the temporary caption/frame.
+            $shown = [Diagnostics.Stopwatch]::StartNew()
+            $stableBounds = $null
+            while ($true) {
+                $windowBounds = [ZommiWindowsAcceptanceNative]::PhysicalBounds($selector) -join ','
+                $clientBounds = [ZommiWindowsAcceptanceNative]::PhysicalClientBounds($selector) -join ','
+                $ready = [ZommiWindowsAcceptanceNative]::Visible($selector) -and
+                    [ZommiWindowsAcceptanceNative]::Foreground($selector) -and
+                    [ZommiWindowsAcceptanceNative]::TopMost($selector) -and
+                    [ZommiWindowsAcceptanceNative]::NamedButtonEnabled($selector,'Cancel') -and
+                    $windowBounds -eq $clientBounds
+                if ($ready -and $stableBounds -eq $clientBounds) { break }
+                if ($shown.ElapsedMilliseconds -gt 5000) { throw 'The borderless capture selector did not finish showing.' }
+                $stableBounds = if ($ready) { $clientBounds } else { $null }
+                Start-Sleep -Milliseconds 50
+            }
+            if ($multiple) {
                 [ZommiAnnotationInput]::Control($true)
                 try {
                     [ZommiWindowsAcceptanceNative]::DragPhysicalSelection($selector,175,195,535,245)
+                    if ($case -eq 'ctrl-release') {
+                        [ZommiAnnotationInput]::Control($false)
+                        Assert-ToolbarNearCrop $selector 245
+                        [ZommiAnnotationInput]::Control($true)
+                    }
+                    # This next crop overlaps the previous crop's toolbar position.
+                    # Ctrl must make that area available for continuous selection.
                     [ZommiWindowsAcceptanceNative]::DragPhysicalSelection($selector,175,270,535,315)
                 } finally { [ZommiAnnotationInput]::Control($false) }
             } else {
@@ -64,9 +120,13 @@ foreach ($case in @('tools','multiple-regions','changed-source','cancel','image-
             while (-not [ZommiWindowsAcceptanceNative]::NamedButtonEnabled($selector,'Attach') -and $watch.ElapsedMilliseconds -lt 1000) { Start-Sleep -Milliseconds 10 }
             $script:annotationReadyMs = $watch.ElapsedMilliseconds
             if (-not [ZommiWindowsAcceptanceNative]::NamedButtonEnabled($selector,'Attach')) { throw 'Selection did not stay open with its drawing toolbar.' }
+            if ($multiple) { Assert-ToolbarNearCrop $selector 315; Save-Toolbar $case }
             Click-Tool $selector 'Pen'
             Click-Tool $selector 'Coral'
             [ZommiWindowsAcceptanceNative]::DragPhysicalSelection($selector,190,210,310,234)
+            $strokeReady = [Diagnostics.Stopwatch]::StartNew()
+            while (-not [ZommiWindowsAcceptanceNative]::NamedButtonEnabled($selector,'Undo') -and $strokeReady.ElapsedMilliseconds -lt 1000) { Start-Sleep -Milliseconds 10 }
+            if (-not [ZommiWindowsAcceptanceNative]::NamedButtonEnabled($selector,'Undo')) { throw "The first annotation stroke was not recorded: $case" }
             if ($case -eq 'tools') {
                 Click-Tool $selector 'Arrow'
                 [ZommiWindowsAcceptanceNative]::DragPhysicalSelection($selector,320,210,425,250)
@@ -80,7 +140,7 @@ foreach ($case in @('tools','multiple-regions','changed-source','cancel','image-
                 Click-Tool $selector 'Undo'
                 Click-Tool $selector 'Redo'
             }
-            if ($case -eq 'multiple-regions') {
+            if ($multiple) {
                 Click-Tool $selector 'Arrow'
                 Click-Tool $selector 'Blue'
                 [ZommiWindowsAcceptanceNative]::DragPhysicalSelection($selector,190,280,445,302)
@@ -88,29 +148,25 @@ foreach ($case in @('tools','multiple-regions','changed-source','cancel','image-
                 Click-Tool $selector 'Redo'
             }
             if ($case -eq 'changed-source') { $fixture.ChangeVisibleText() }
-            if ($case -eq 'tools') {
-                Start-Sleep -Milliseconds 150
-                $bitmap = [Drawing.Bitmap]::new(900,600)
-                $graphics = [Drawing.Graphics]::FromImage($bitmap)
-                try {
-                    $graphics.CopyFromScreen(140,140,0,0,$bitmap.Size)
-                    $bitmap.Save((Join-Path $OutputDirectory 'toolbar-native.png'),[Drawing.Imaging.ImageFormat]::Png)
-                } finally { $graphics.Dispose(); $bitmap.Dispose() }
+            if ($case -eq 'tools') { Save-Toolbar 'native' }
+            if ($case -eq 'hover-source') {
+                [ZommiWindowsAcceptanceNative]::SetPhysicalCursorPos(210,215) | Out-Null
+                [ZommiWindowsAcceptanceNative]::ConfirmSelection($selector)
             }
-            if ($case -eq 'cancel') { [ZommiWindowsAcceptanceNative]::CancelSelection($selector) | Out-Null }
+            elseif ($case -eq 'cancel') { [ZommiWindowsAcceptanceNative]::CancelSelection($selector) | Out-Null }
             else { Click-Tool $selector 'Attach' }
         }
         if ($case -eq 'cancel') {
             if (-not $result.cancelled -or $result.dataUrl -or $result.selections) { throw 'Cancel leaked annotated attachments.' }
         } else {
             if ($result.cancelled) { throw "Annotation capture cancelled: $($result.errorMessage)" }
-            $items = if ($case -eq 'multiple-regions') { @($result.selections) } else { @($result) }
-            $expectedItems = if ($case -eq 'multiple-regions') { 2 } else { 1 }
+            $items = if ($multiple) { @($result.selections) } else { @($result) }
+            $expectedItems = if ($multiple) { 2 } else { 1 }
             if ($items.Count -ne $expectedItems) { throw 'Annotation region association changed.' }
             for ($i=0; $i -lt $items.Count; $i++) {
                 $item = $items[$i]
                 $expected = if ($case -eq 'tools') { 5 } else { 1 }
-                if ($item.snapshot.imageAnnotations.strokeCount -ne $expected -or $item.snapshot.imageAnnotations.source -ne 'user' -or -not $item.snapshot.imageAnnotations.bakedIntoImage) { throw "Missing or wrong annotation provenance: $case" }
+                if ($item.snapshot.imageAnnotations.strokeCount -ne $expected -or $item.snapshot.imageAnnotations.source -ne 'user' -or -not $item.snapshot.imageAnnotations.bakedIntoImage) { throw "Missing or wrong annotation provenance: $case; expected=$expected; actual=$($item.snapshot.imageAnnotations | ConvertTo-Json -Compress)" }
                 $color = if ($i -eq 0) { 'coral' } else { 'blue' }
                 $pixels = Assert-ColoredPixels $item $color
                 $bytes = [Convert]::FromBase64String($item.dataUrl.Substring($item.dataUrl.IndexOf(',')+1))
@@ -126,6 +182,6 @@ foreach ($case in @('tools','multiple-regions','changed-source','cancel','image-
         Write-Host "annotations-${case}: ok"
     } finally { $fixture.Dispose() }
 }
-$evidence = @{captureHelper=$CaptureHost;sha256=(Get-FileHash $CaptureHost -Algorithm SHA256).Hash.ToLowerInvariant();implementationSha256=(Get-FileHash ([IO.Path]::ChangeExtension($CaptureHost,'.dll')) -Algorithm SHA256).Hash.ToLowerInvariant();cases=$results;cancelVerified=$true}
+$evidence = @{captureHelper=$CaptureHost;sha256=(Get-FileHash $CaptureHost -Algorithm SHA256).Hash.ToLowerInvariant();implementationSha256=(Get-FileHash ([IO.Path]::ChangeExtension($CaptureHost,'.dll')) -Algorithm SHA256).Hash.ToLowerInvariant();cases=$results;cancelVerified=(-not $HoverOnly)}
 [IO.File]::WriteAllText((Join-Path $OutputDirectory 'result.json'),($evidence | ConvertTo-Json -Depth 12))
 $evidence | ConvertTo-Json -Depth 12
